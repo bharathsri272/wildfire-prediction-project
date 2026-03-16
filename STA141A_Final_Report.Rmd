@@ -1,0 +1,436 @@
+---
+title: "STA 141A:  Predicting Wildfire Incidence in the United States"
+author:  
+output: html_document
+---
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+```
+
+
+## Abstract
+
+This project investigates the prediction of wildfire occurrence using spatial and seasonal features derived from a wildfire dataset. Exploratory data analysis reveals strong geographic clustering of wildfires in the western United States as well as clear seasonal patterns in wildfire activity. Two classification models, logistic regression and random forest, are developed to predict wildfire occurrence using spatial location and cyclic month variables. Model performance is evaluated using a rolling time-based validation approach and measured using the Area Under the ROC Curve (AUC). The results show that the random forest model substantially outperforms the logistic regression model, demonstrating the benefit of flexible machine learning methods for wildfire prediction.
+
+---
+
+
+## Introduction 
+
+Wildfires pose significant environmental and economic challenges in many regions of the United States. Understanding patterns in wildfire occurrence and developing predictive models can help improve risk assessment and resource planning. In this report, we utilize a dataset of wildfire occurrences to develop these models. Our data comes from a subset that was derived from this Kaggle dataset: https://www.kaggle.com/datasets/rtatman/188-million-us-wildfires/data. We use spatial and seasonal features to build classification models that predict wildfire occurrence. This report has 5 sections, beginning with data preprocessing and ending with an overall summary. Analysis begins with exploratory data analysis to identify important patterns in the data, followed by the development and evaluation of predictive models.
+
+---
+
+
+### 1. Data Preprocessing
+
+The raw wildfire dataset contains records of wildfire ignition locations, discovery dates, containment dates, and burned area across the United States.
+
+Since the majority of fires are very small and quickly contained, we focus on *notable fires*. Following the project recommendation, we filter the dataset to retain only fires with a final burned area of at least 300 acres.
+
+Temporal variables are then derived from the discovery date, including the month and year of each fire. These variables allow us to examine seasonal wildfire patterns and define the time units used in the prediction task. The resulting dataset contains notable fires along with the spatial and temporal variables used in the subsequent exploratory analysis and modeling steps.
+
+```{r}
+# Section 1 Code
+
+library(tidyverse)
+
+fires <- read.csv("/Users/bharathramsridhar/Downloads/wildfires_sample_100k.csv")
+fires$DISCOVERY_DATE <- as.Date(fires$DISCOVERY_DATE - 2440587.5, origin = "1970-01-01")
+fires$year <- as.numeric(substr(fires$DISCOVERY_DATE, 1, 4))
+fires$month <- as.numeric(substr(fires$DISCOVERY_DATE, 6, 7))
+
+fires_clean <- fires %>%
+  filter(FIRE_SIZE >= 300) %>%
+  mutate(
+    lat_bin = floor(LATITUDE / 2) * 2,
+    lon_bin = floor(LONGITUDE / 2) * 2,
+    month = as.numeric(format(DISCOVERY_DATE, "%m")),
+    year  = as.numeric(format(DISCOVERY_DATE, "%Y"))
+  )
+
+fires_clean$lat_bin <- floor(fires_clean$LATITUDE / 2) * 2
+fires_clean$lon_bin <- floor(fires_clean$LONGITUDE / 2) * 2
+fires_clean$year  <- as.numeric(format(fires_clean$DISCOVERY_DATE, "%Y"))
+
+fire_counts <- fires_clean %>%
+  group_by(lat_bin, lon_bin, year, month) %>%
+  summarise(fire_count = n(), .groups = "drop")
+fire_counts$month <- as.numeric(fire_counts$month)
+
+locations <- fires %>%
+  mutate(
+    lat_bin = floor(LATITUDE / 2) * 2,
+    lon_bin = floor(LONGITUDE / 2) * 2
+  ) %>%
+  distinct(lat_bin, lon_bin)
+
+grid <- locations %>%
+  crossing(
+    year = unique(fires_clean$year),
+    month = 1:12
+  )
+
+data_model <- left_join(grid, fire_counts,
+                        by=c("lat_bin","lon_bin","year","month"))
+
+data_model$fire_count[is.na(data_model$fire_count)] <- 0
+data_model$fire_occurrence <- ifelse(data_model$fire_count>0,1,0)
+
+head(fires_clean)
+
+fires_clean %>%
+  summarise(
+    total_fires = n(),
+    avg_fire_size = mean(FIRE_SIZE, na.rm = TRUE),
+    min_fire_size = min(FIRE_SIZE, na.rm = TRUE),
+    max_fire_size = max(FIRE_SIZE, na.rm = TRUE)
+  )
+
+```
+
+---
+
+
+### 2. Exploratory Data Analysis  
+
+In this EDA, we will explore patterns in the wildfire dataset to better understand the spatial and seasonal characteristics of wildfire occurrence. The goal of this EDA is to identify important features and trends that may be useful for predicting wildfire events. In particular, we will look closely at seasonal patterns, geographic clustering, and trends over time.
+
+```{r}
+#Section 2 Code
+
+ggplot(fires_clean, aes(FIRE_SIZE)) +
+  geom_histogram(bins=50) +
+  scale_x_log10()
+
+```
+
+The distribution of wildfire sizes is heavily skewed to the right, with most fires being relatively small and a small number of extremely large fires. This shows that we should focus on notable fires when developing our predictive models.
+
+
+```{r}
+ggplot(fires_clean, aes(x = month)) +
+  geom_bar(fill = "orange") +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    title = "Number of Notable Wildfires by Month",
+    x = "Month",
+    y = "Number of Fires"
+  )
+
+```
+
+This bar graph shows the number of notable wildfires occurring in each month of the year. Wildfire activity increases substantially during the late spring and summer months, with the highest peaks occurring from June to August. This strong seasonal pattern suggests that wildfire risk varies throughout the year, which suggests that we should include cyclic month variables (month_sin and month_cos) as predictors in the models we build.
+
+
+```{r}
+library(maps)
+
+fires_map <- fires_clean %>%
+  filter(LATITUDE >= 25 & LATITUDE <= 50,
+         LONGITUDE >= -125 & LONGITUDE <= -66)
+
+us_map <- map_data("state")
+
+ggplot() +
+  geom_polygon(data = us_map,
+               aes(x = long, y = lat, group = group),
+               fill = "gray90",
+               color = "white") +
+  geom_point(data = fires_map,
+             aes(x = LONGITUDE, y = LATITUDE),
+             color = "red",
+             alpha = 0.3,
+             size = 0.7) +
+  coord_fixed(1.3, xlim = c(-125, -66), ylim = c(25, 50)) +
+  labs(
+    title = "Spatial Distribution of Notable Wildfires in the Contiguous United States",
+    x = "Longitude",
+    y = "Latitude"
+  )
+
+```
+
+```{r, fig.width=6, fig.height=4, out.width="70%"}
+library(gganimate)
+
+p <- ggplot() +
+  geom_polygon(data = us_map,
+               aes(x = long, y = lat, group = group),
+               fill = "gray90",
+               color = "white") +
+  geom_point(data = fires_map,
+             aes(x = LONGITUDE, y = LATITUDE),
+             color = "red",
+             alpha = 0.3,
+             size = 0.7) +
+  coord_fixed(1.3, xlim = c(-125, -66), ylim = c(25, 50)) +
+  labs(title = "Wildfires in the United States: Year {round(frame_time)}") +
+  transition_time(year)
+
+animate(p, nframes = 80, fps = 8)
+```
+
+```{r}
+data_model %>%
+  group_by(lat_bin, lon_bin) %>%
+  summarise(fire_rate = mean(fire_occurrence)) %>%
+  ggplot(aes(lon_bin, lat_bin, fill = fire_rate)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  labs(
+    title="Observed Wildfire Frequency by Location",
+    fill="Fire Rate"
+  )
+
+```
+
+The overall spatial distribution map, the wildfires over time map, and the fire frequency heatmap all show that notable wildfires are concentrated primarily in the western United States, particularly in California, Idaho, and Utah, with some concentrations in the southeastern region of the US as well. These regions contain large forested areas and dry climates that are more prone to wildfire activity. This geographic clustering suggests that spatial variables such as latitude and longitude are also likely to be important predictors in the modeling stage. Including these variables allows the models to capture regional wildfire risk differences across the United States.
+
+
+```{r}
+fires_clean %>%
+  group_by(year) %>%
+  summarise(fires = n()) %>%
+  ggplot(aes(x = year, y = fires, group = 1)) +
+  geom_line(color="darkred") +
+  geom_point() +
+  labs(
+    title="Number of Notable Wildfires Over Time",
+    x="Year",
+    y="Number of Fires"
+  )
+
+```
+
+This time series plot shows the number of notable wildfires recorded each year. The number of fires fluctuates substantially from year to year, with several peaks during the mid-2000s. While there is some variability over time, the seasonal patterns observed earlier seem to be stronger drivers of wildfire occurrence.
+
+
+```{r}
+fires_clean %>%
+  group_by(month) %>%
+  summarise(avg_fire_size = mean(FIRE_SIZE, na.rm = TRUE)) %>%
+  ggplot(aes(x = month, y = avg_fire_size)) +
+  geom_line(color = "darkorange") +
+  geom_point() +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    title = "Average Fire Size by Month",
+    x = "Month",
+    y = "Average Fire Size (acres)"
+  )
+
+```
+
+This plot shows how the average size of notable wildfires varies across months. Average fire size increases sharply during late spring and early summer, with the largest fires occurring around June. This pattern further supports the presence of strong seasonal wildfire dynamics, where environmental conditions during warmer months allow fires to grow larger.
+
+---
+
+
+### 3. Modeling
+
+In this section, we will create two classification models to predict wildfire occurrence: a logistic regression model and a random forest model. These models use spatial variables (lat_bin, lon_bin) and cyclic seasonal variables (month_sin, month_cos) as predictors. This section focuses on specifying and fitting the models, and we will fit and test their predictive performance in the next section.
+
+```{r}
+# Section 3 Code
+
+data_model <- data_model %>%
+  mutate(
+    month_sin = sin(2 * pi * month / 12),
+    month_cos = cos(2 * pi * month / 12)
+  )
+
+```
+
+```{r}
+log_model <- glm(
+  fire_occurrence ~ lat_bin + lon_bin + month_sin + month_cos,
+  data = data_model,
+  family = "binomial"
+)
+
+summary(log_model)
+
+```
+
+We first implement a logistic regression model as the baseline model. Logistic regression is a simple and interpretable classification model that estimates the probability of wildfire occurrence as a function of geographic (lat_bin, lon_bin) and seasonal (month_sin, month_cos) predictors. This model gives us a benchmark against which we can test a more flexible machine learning model.
+
+
+```{r}
+library(randomForest)
+
+rf_model <- randomForest(
+  as.factor(fire_occurrence) ~ lat_bin + lon_bin + month_sin + month_cos,
+  data = data_model,
+  ntree = 300,
+  sampsize = rep(min(table(data_model$fire_occurrence)), 2)
+)
+
+rf_model
+
+varImpPlot(rf_model,
+           main = "Random Forest Feature Importance")
+
+```
+
+We next create a random forest classifier using the same predictors we used for the logistic regression model. Random forests combine many decision trees to capture nonlinear relationships and interactions between variables, so they have more complex methods than logistic regression models and can accommodate much more. The feature importance plot shows that latitude and longitude are the most influential predictors, while the seasonal variables also contribute to prediction. The strong importance of longitude and latitude could suggest that wildfire occurrence is  influenced by geographic location, which shows differences in climate, vegetation, and land use across regions.
+
+The models here are fit using the available dataset to show the model structure and predictors used for wildfire classification. This lets us examine model behavior and feature importance, but they do not represent a formal evaluation of predictive performance. In the next section, we will fit the models again using a rolling time-based validation approach so that predictions can be evaluated on data that was not used during training.
+
+---
+
+
+### 4. Model Fitting and Validation
+
+Now, we will fit and evaluate both models. We will use a rolling time-based method to evaluate them both. For each year, the models will be trained on data from every year before so that they can be tested on that year. This approach makes sure that predictions are evaluated on out-of-sample data and more closely reflects how the models would perform in practice. We are using the AUC values of both models to evaluate them.
+
+
+```{r}
+# Section 4 Code
+
+library(purrr)
+library(pROC)
+
+years_sorted <- sort(unique(data_model$year))
+years_sorted
+length(years_sorted)
+min_train_years <- 3
+
+results <- tibble(
+  train_end_year = years_sorted[min_train_years:(length(years_sorted)-1)],
+  test_year = years_sorted[(min_train_years+1):length(years_sorted)]
+)
+
+results <- results %>%
+  mutate(
+
+    auc_glm = map2_dbl(train_end_year, test_year, function(tr_end, te_year){
+
+      train <- filter(data_model, year <= tr_end)
+      test  <- filter(data_model, year == te_year)
+
+      fit <- glm(
+        fire_occurrence ~ lat_bin + lon_bin + month_sin + month_cos,
+        data = train,
+        family = "binomial"
+      )
+
+      probs <- predict(fit, newdata = test, type = "response")
+
+      as.numeric(roc(test$fire_occurrence, probs, quiet = TRUE)$auc)
+    }),
+
+    auc_rf = map2_dbl(train_end_year, test_year, function(tr_end, te_year){
+
+      train <- filter(data_model, year <= tr_end) 
+      test  <- filter(data_model, year == te_year)
+
+      rf_fit <- randomForest(
+        as.factor(fire_occurrence) ~ lat_bin + lon_bin + month_sin + month_cos,
+        data = train,
+        ntree = 200,
+        sampsize = rep(min(table(train$fire_occurrence)), 2)
+      )
+
+      probs <- predict(rf_fit, newdata = test, type = "prob")[,2]
+
+      as.numeric(roc(test$fire_occurrence, probs, quiet = TRUE)$auc)
+    })
+    
+  )
+
+results
+
+```
+
+To evaluate predictive performance, we use rolling time-based validation procedure. For each year, the models are trained on all data from previous years and then tested on the following year. This approach mimics a real-world prediction setting, where future wildfire occurrences must be predicted using only past information. The procedure produces predicted probabilities for wildfire occurrence in the test year, which are then used to compute model performance metrics such as AUC. From the results, we can see that the logistic regression model's AUC mostly hovers around the 0.7 area, while the random forest model's AUC is consistently in the 0.8's, so it is significantly outdoing the logistic regression model.
+
+
+```{r}
+library(ggplot2)
+
+results %>%
+  pivot_longer(cols = c(auc_glm, auc_rf),
+               names_to = "model",
+               values_to = "AUC") %>%
+  ggplot(aes(x = test_year, y = AUC, color = model)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Model Performance Across Validation Years",
+    x = "Validation Year",
+    y = "AUC"
+  )
+
+```
+
+This plot shows the predictive performance of the logistic regression and random forest model across multiple validation years. Performance is measured using the AUC values that we derived in the fitting procedure previously. The plot shows that both models have roughly the same trend in predicting from year to year, but the random forest model always has a significantly higher AUC than the logistic regression model. This suggests that the random forest model provides stronger predictive performance across the different yearly validation splits.
+
+
+```{r}
+train_end <- max(results$train_end_year)
+test_year <- max(results$test_year)
+
+train <- dplyr::filter(data_model, year <= train_end)
+test  <- dplyr::filter(data_model, year == test_year)
+
+glm_probs <- predict(log_model, newdata = test, type = "response")
+
+rf_probs <- predict(rf_model, newdata = test, type = "prob")[,2]
+
+roc_glm <- roc(test$fire_occurrence, glm_probs)
+roc_rf  <- roc(test$fire_occurrence, rf_probs)
+
+plot(roc_glm,
+     col = "blue",
+     lwd = 2,
+     main = "ROC Curve Comparison")
+
+plot(roc_rf,
+     col = "red",
+     lwd = 2,
+     add = TRUE)
+
+legend("bottomright",
+       legend = c(
+         paste("Logistic Regression AUC =", round(auc(roc_glm),3)),
+         paste("Random Forest AUC =", round(auc(roc_rf),3))
+       ),
+       col = c("blue","red"),
+       lwd = 2)
+
+```
+
+This ROC plot compares the classification performance of the logistic regression and random forest models on the validation data. The ROC curve illustrates the tradeoff between the true positive rate (sensitivity) and the false positive rate for different classification thresholds. The random forest model achieves a much higher AUC (0.927) than the logistic regression model (0.673), indicating substantially stronger predictive performance. This suggests that the random forest model is better able to capture nonlinear relationships and interactions in the wildfire data.
+
+Overall, these results show that incorporating nonlinear machine learning methods such as random forests can significantly improve wildfire prediction relative to traditional linear models.
+
+---
+
+
+### 5. Summary
+
+In this project, we developed predictive models to classify notable wildfire occurrences in the United States using spatial and seasonal predictors derived from wildfire records. The exploratory data analysis revealed strong seasonal and geographic patterns in wildfire activity. The number of fires increases substantially during the late spring and summer months, and the average fire size also peaks during this period, with the largest fires occurring around June. Spatial visualizations further showed that wildfires are heavily concentrated in the western United States, suggesting that both geographic location and seasonal climate conditions play an important role in wildfire risk. 
+
+We used two predictive models to classify wildfire occurrence: a baseline logistic regression model and a more flexible random forest classifier. Logistic regression provided an interpretable statistical model that estimates wildfire probability as a function of latitude, longitude, and cyclic seasonal variables. The random forest model extended this by capturing nonlinear relationships and interactions between predictors through an ensemble of decision trees. Feature importance results from the random forest model indicate that geographic variables (longitude and latitude) are the most influential predictors, while seasonal predictors also contribute meaningfully to wildfire prediction.
+
+Model performance was evaluated using a rolling time-based validation approach in which models were trained on data from previous years and tested on the following year. Predictive performance was measured using the Area Under the ROC Curve (AUC). The results show that the random forest model consistently outperforms the logistic regression model across validation years. The ROC curve comparison further highlights this difference, with the random forest achieving an AUC of approximately 0.927 compared to 0.673 for the logistic regression model. These results suggest that the random forest model is better able to capture complex patterns in wildfire occurrence.
+
+Overall, the analysis demonstrates that incorporating nonlinear machine learning methods can substantially improve predictive performance for wildfire classification. Future improvements could include incorporating additional environmental predictors such as temperature, precipitation, vegetation, and wind conditions, as well as using finer spatial resolution data. Also, we could use a more advanced model such as a neural network to get more accurate results. Such enhancements could further improve our ability to identify regions at high risk of wildfire occurrence.
+
+---
+
+### Code
+
+```{r appendix, ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+
+```
+
